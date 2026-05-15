@@ -1,10 +1,9 @@
 """
-PPO Crypto Trainer — BTC/ETH/SOL/BNB
-Train: bybit hourly candles → MaskablePPO
+PPO Crypto Trainer v2 — Bybit BTC/ETH/SOL/BNB
+Pattern: trading_portfolio.py (yfinance) with Bybit data.
 """
-import os, sys, time, traceback
+import os, sys, time
 from datetime import datetime, timezone
-
 sys.path.insert(0, "M:/temp_downloads")
 os.chdir("C:/OpenMythos")
 
@@ -16,58 +15,53 @@ import torch
 from dotenv import load_dotenv
 from pybit.unified_trading import HTTP
 
-load_dotenv("M:/temp_downloads/.env")
+# Force UTF-8 on Windows
+import io, sys
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
-# ─── CONFIG ─────────────────────────────────────────────────────────────────
-TICKERS    = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
-WINDOW     = 60
-COMMISSION = 0.0005   # Bybit spot
+load_dotenv("C:/OpenMythos/.env")
 BYBIT_KEY    = os.getenv("BYBIT_API_KEY", "")
 BYBIT_SECRET = os.getenv("BYBIT_API_SECRET", "")
-# ─────────────────────────────────────────────────────────────────────────────
+
+# Config
+TICKERS   = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
+WINDOW    = 60
+TRAIN_RATIO = 0.80
+COMMISSION  = 0.0005
 
 print("=" * 60)
-print("  PPO Crypto Trainer — BTC/ETH/SOL/BNB")
+print("  PPO Crypto Trainer v2 — BTC/ETH/SOL/BNB")
 print("=" * 60)
-print(f"  CUDA available: {torch.cuda.is_available()}")
+print(f"  CUDA: {torch.cuda.is_available()}")
 if torch.cuda.is_available():
     print(f"  GPU: {torch.cuda.get_device_name(0)}")
-print()
 
-# Force UTF-8
-import sys, io
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+# ─── DATA ────────────────────────────────────────────────────────────────────
 
-# ─── DATA DOWNLOAD ────────────────────────────────────────────────────────────
-
-def download_crypto(ticker, limit=5000):
-    """Download hourly candles from Bybit."""
+def download_bybit(ticker):
+    """Download up to 1000 hourly candles from Bybit."""
     try:
         client = HTTP(api_key=BYBIT_KEY, api_secret=BYBIT_SECRET)
-        all_rows = []
-        cursor = None
-
-        # Bybit max limit per request is 1000
-        kwargs = {"category": "linear", "symbol": ticker, "interval": 60, "limit": 1000}
-        resp = client.get_kline(**kwargs)
+        resp = client.get_kline(category="linear", symbol=ticker,
+                                 interval=60, limit=1000)
         if resp.get("retCode") != 0:
             print(f"    [!] {ticker}: {resp['retMsg']}")
             return None
-
         rows = resp["result"]["list"]
+        all_rows = []
+        cursor = resp["result"].get("nextPageCursor")
         for r in rows:
             ts_ms = int(r[0])
             if ts_ms > 1e12:
                 ts_ms //= 1000
             o, h, l, c, v = map(float, r[1:6])
-            all_rows.append({
-                "ts": datetime.fromtimestamp(ts_ms, tz=timezone.utc),
-                "open": o, "high": h, "low": l, "close": c, "volume": v,
-            })
-
-        cursor = resp["result"].get("nextPageCursor")
-        # Fetch next pages if needed and available
-        while cursor and len(all_rows) < limit:
+            all_rows.append(dict(
+                ts=datetime.fromtimestamp(ts_ms, tz=timezone.utc),
+                open=o, high=h, low=l, close=c, volume=v,
+            ))
+        # Pagination
+        while cursor and len(all_rows) < 2000:
             resp = client.get_kline(category="linear", symbol=ticker,
                                     interval=60, limit=200, cursor=cursor)
             if resp.get("retCode") != 0:
@@ -80,26 +74,23 @@ def download_crypto(ticker, limit=5000):
                 if ts_ms > 1e12:
                     ts_ms //= 1000
                 o, h, l, c, v = map(float, r[1:6])
-                all_rows.append({
-                    "ts": datetime.fromtimestamp(ts_ms, tz=timezone.utc),
-                    "open": o, "high": h, "low": l, "close": c, "volume": v,
-                })
+                all_rows.append(dict(
+                    ts=datetime.fromtimestamp(ts_ms, tz=timezone.utc),
+                    open=o, high=h, low=l, close=c, volume=v,
+                ))
             cursor = resp["result"].get("nextPageCursor")
             if not cursor:
                 break
-
         df = pd.DataFrame(all_rows[::-1]).reset_index(drop=True)
-        s = f"  {ticker}: {len(df)} bars | {df['ts'].iloc[0].date()} - {df['ts'].iloc[-1].date()}"
-        print(s)
+        print(f"  {ticker}: {len(df)} bars | {df['ts'].iloc[0].date()} - {df['ts'].iloc[-1].date()}")
         return df
     except Exception as e:
-        print(f"  [!] {ticker} download failed: {e}")
+        print(f"  [!] {ticker}: {e}")
         return None
-
 
 # ─── INDICATORS ──────────────────────────────────────────────────────────────
 
-def compute_all(close, high, low, window=WINDOW):
+def compute_indicators(close, high, low):
     n = len(close)
     # RSI-14 (vectorized)
     deltas = np.diff(close, prepend=close[0])
@@ -108,80 +99,89 @@ def compute_all(close, high, low, window=WINDOW):
     avg_gain = np.convolve(gains,  np.ones(14)/14, mode="same")
     avg_loss = np.convolve(losses, np.ones(14)/14, mode="same")
     rs  = avg_gain / (avg_loss + 1e-10)
-    rsi = 100 - (100 / (1 + rs))
+    rsi = (100 - (100 / (1 + rs))).astype(np.float32)
 
-    # Bollinger Bands (20-period)
+    # BB (20-period)
     sma20 = np.convolve(close, np.ones(20)/20, mode="same")
-    std20 = np.array([close[max(0,i-20):i+1].std() for i in range(n)])
-    bb_up = sma20 + 2 * std20
-    bb_lo = sma20 - 2 * std20
+    std20 = np.array([close[max(0,i-20):i+1].std() for i in range(n)], dtype=np.float32)
+    bb_up = (sma20 + 2 * std20).astype(np.float32)
+    bb_lo = (sma20 - 2 * std20).astype(np.float32)
 
     # ATR-14
-    tr = np.zeros(max(0, n-1))
+    tr = np.zeros(n-1, dtype=np.float32)
     for i in range(1, n):
         tr[i-1] = max(high[i], close[i-1]) - min(low[i], close[i-1])
-    atr = np.convolve(tr, np.ones(14)/14, mode="same")
+    atr = np.convolve(tr, np.ones(14)/14, mode="same").astype(np.float32)
 
     # Returns
-    pct_ret = np.concatenate([[0], np.diff(close) / (close[:-1] + 1e-10)])
+    pct_ret = np.concatenate([[0], np.diff(close) / (close[:-1] + 1e-10)]).astype(np.float32)
 
-    return rsi, bb_up, bb_lo, atr, pct_ret
+    # Volatility (annualized 20-period)
+    vol = np.full(n, 0.0, dtype=np.float32)
+    for i in range(20, n):
+        v = np.std(pct_ret[i-20:i]) * np.sqrt(365 * 24)  # hourly
+        vol[i] = v if not np.isnan(v) else 0.0
 
+    return rsi, bb_up, bb_lo, atr, pct_ret, vol
 
 # ─── ENV ──────────────────────────────────────────────────────────────────────
 
-class CryptoEnv(gym.Env):
+class CryptoTradeEnv(gym.Env):
     """
     obs = [rsi/100, bb_pos, atr_pct, vol, position] + returns_window(WINDOW)
-    act = 0 (HOLD), 1 (BUY/close)
+    action = 0 (HOLD), 1 (BUY/open or close)
     """
-    def __init__(self, close, high, low, rsi, bb_up, bb_lo, atr, rets,
-                 window=WINDOW, commission=COMMISSION):
+    def __init__(self, close, high, low, rsi, bb_up, bb_lo, atr, pct_ret, vol,
+                 commission=COMMISSION, window=WINDOW):
         super().__init__()
-        self.close  = close.astype(np.float32)
-        self.high   = high.astype(np.float32)
-        self.low    = low.astype(np.float32)
-        self.rsi    = rsi.astype(np.float32)
-        self.bb_up  = bb_up.astype(np.float32)
-        self.bb_lo  = bb_lo.astype(np.float32)
-        self.atr    = atr.astype(np.float32)
-        self._rets  = rets.astype(np.float32)
-        self.window = window
+        self.close   = close.astype(np.float32)
+        self.high    = high.astype(np.float32)
+        self.low     = low.astype(np.float32)
+        self.rsi     = np.nan_to_num(rsi, nan=50.0).astype(np.float32)
+        self.bb_up   = bb_up.astype(np.float32)
+        self.bb_lo   = bb_lo.astype(np.float32)
+        self.atr     = atr.astype(np.float32)
+        self._rets   = pct_ret.astype(np.float32)
+        self._vol    = vol.astype(np.float32)
         self.commission = commission
-        self.n = n = len(close)
-
-        # volatility
-        self._vol = np.array([
-            np.std(rets[max(0,i-20):i]) * np.sqrt(365)
-            for i in range(n)
-        ], dtype=np.float32)
-
-        self.max_step     = n - window - 1
+        self.window   = window
+        self.n        = len(close)
+        self.max_step = self.n - window - 1
         self.current_step = window
-        self.position     = 0
-        self.entry_price  = 0.0
+        self.position = 0
+        self.entry_price = 0.0
+
         self.action_space = spaces.Discrete(2)
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(window + 5,), dtype=np.float32)
+            low=-np.inf, high=np.inf,
+            shape=(window + 5,),
+            dtype=np.float32)
 
     def _get_obs(self):
         i = self.current_step
-        ret_win = self._rets[i - self.window:i]
-        rsi_v = float(self.rsi[i] if not np.isnan(self.rsi[i]) else 50.0) / 100
+        # Returns window
+        rets_win = self._rets[i - self.window:i].copy()
+        if len(rets_win) < self.window:
+            rets_win = np.pad(rets_win, (self.window - len(rets_win), 0))
+        # Indicators
+        rsi_v = float(self.rsi[i] / 100)
         bb_p  = float((self.close[i] - self.bb_lo[i]) /
-                      (self.bb_up[i] - self.bb_lo[i] + 1e-10))
+                       (self.bb_up[i] - self.bb_lo[i] + 1e-10))
         atr_p = float(self.atr[i] / (self.close[i] + 1e-10))
         vol_v = float(self._vol[i])
-        pos   = 1.0 if self.position == 1 else 0.0
-        return np.concatenate([[rsi_v, bb_p, atr_p, vol_v, pos]], dtype=np.float32)
+        pos   = 1.0 if self.position else 0.0
+        feat  = np.array([rsi_v, bb_p, atr_p, vol_v, pos], dtype=np.float32)
+        obs   = np.concatenate([feat, rets_win])
+        assert obs.shape == (self.window + 5,), f"obs shape {obs.shape} != {(self.window+5,)}"
+        return obs
 
     def action_masks(self):
         return np.array([True, True], dtype=bool)
 
     def reset(self, seed=None, **kwargs):
         super().reset(seed=seed)
-        self.position     = 0
-        self.entry_price  = 0.0
+        self.position    = 0
+        self.entry_price = 0.0
         self.current_step = self.window
         return self._get_obs(), {}
 
@@ -190,24 +190,22 @@ class CryptoEnv(gym.Env):
         c  = self.close[i]
         reward = 0.0
 
-        # Close existing
         if self.position != 0:
             reward = (c - self.entry_price) / (self.entry_price + 1e-10) - self.commission
-            self.position = 0
+            self.position    = 0
             self.entry_price = 0.0
 
-        # Open long
         if action == 1:
             self.position    = 1
             self.entry_price = c
 
         self.current_step += 1
         done = self.current_step >= self.max_step
-        return self._get_obs(), reward, done, False, {}
+        return self._get_obs(), float(reward), done, False, {}
 
 
-class MultiEnv(gym.Env):
-    """Wrapper — randomly selects ticker each step (train only)."""
+class MultiInputEnv(gym.Env):
+    """Randomly picks ticker each step — SB3-compatible standalone env."""
     def __init__(self, envs):
         super().__init__()
         self.envs = envs
@@ -217,24 +215,36 @@ class MultiEnv(gym.Env):
         self.action_space      = envs[0].action_space
         self._rng = np.random.default_rng(42)
 
-    def reset(self, seed=None, **kwargs):
+    def _set_active(self):
         self._active = int(self._rng.integers(0, self.n))
+
+    def reset(self, seed=None, **kwargs):
+        self._set_active()
         obs, info = self.envs[self._active].reset(seed=seed)
-        return np.array(obs).astype(np.float32), info
+        self._sync()
+        return obs.astype(np.float32), info
+
+    def _sync(self):
+        e = self.envs[self._active]
+        self.close        = e.close
+        self.current_step = e.current_step
+        self.position     = e.position
+        self.entry_price  = e.entry_price
 
     def step(self, action):
-        self._active = int(self._rng.integers(0, self.n))
-        result = self.envs[self._active].step(action)
+        self._set_active()
+        result = self.envs[self._active].step(int(action))
         obs, reward, done, trunc, info = result
-        return np.array(obs).astype(np.float32), reward, done, trunc, info
+        self._sync()
+        return obs.astype(np.float32), reward, done, trunc, info
 
     def action_masks(self):
         return self.envs[self._active].action_masks()
 
 
-# ─── INFERENCE ───────────────────────────────────────────────────────────────
+# ─── VALIDATION ──────────────────────────────────────────────────────────────
 
-def run_agent(model, env, deterministic=True):
+def run_agent(model, env):
     obs, _ = env.reset()
     done   = False
     cum    = 0.0
@@ -243,7 +253,7 @@ def run_agent(model, env, deterministic=True):
 
     while not done:
         mask = env.action_masks()
-        act, _ = model.predict(np.array(obs), action_masks=mask, deterministic=deterministic)
+        act, _ = model.predict(obs, action_masks=mask, deterministic=True)
         prev_pos = curr_pos
 
         obs, _, done, _, _ = env.step(int(act))
@@ -252,72 +262,67 @@ def run_agent(model, env, deterministic=True):
             if prev_pos == 1:
                 pnl = (env.close[env.current_step-1] - curr_entry) / curr_entry * 100
                 cum += pnl
-                trades.append({"type": "exit", "pnl": pnl/100})
+                trades.append({"pnl": pnl/100})
             if env.position == 1:
-                curr_pos   = 1
-                curr_entry = env.close[env.current_step-1]
+                curr_pos, curr_entry = 1, env.close[env.current_step-1]
             else:
                 curr_pos, curr_entry = 0, 0.0
 
-    return cum, trades
-
-
-def metrics(cum_pnl, trades):
-    if not trades:
-        return {"return": 0, "sharpe": 0, "max_dd": 0, "n": 0}
     pnls = [t["pnl"] for t in trades]
-    win_rate = sum(1 for p in pnls if p > 0) / max(len(pnls), 1) * 100
-    return {
-        "return": round(cum_pnl, 2),
-        "sharpe": 0,  # would need equity series
-        "max_dd": 0,
-        "n": len(trades),
-        "win_rate": round(win_rate, 1),
-    }
+    win  = sum(1 for p in pnls if p > 0) / max(len(pnls), 1) * 100 if pnls else 0
+    return {"return": round(cum, 2), "n_trades": len(trades), "win_rate": round(win, 1)}
 
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
-print("[1] Downloading crypto data from Bybit...")
+print("\n[1] Downloading Bybit data...")
 all_data = {}
 for ticker in TICKERS:
-    df = download_crypto(ticker)
+    df = download_bybit(ticker)
     if df is not None and len(df) >= WINDOW + 100:
         all_data[ticker] = df
-    time.sleep(0.5)
+    time.sleep(0.3)
 
-print(f"\nDownloaded {len(all_data)}/{len(TICKERS)} tickers")
+print(f"\nDownloaded: {len(all_data)}/{len(TICKERS)} tickers")
+if len(all_data) < len(TICKERS):
+    print("[!] Some tickers failed — continuing anyway")
 
 if not all_data:
-    print("[!] No data downloaded. Exiting.")
+    print("[!] No data. Exiting.")
     sys.exit(1)
 
-# Build envs
-print("\n[2] Building gym environments...")
-envs_train = []
-envs_val   = {}
+print("\n[2] Building environments...")
+train_envs = []
+val_envs   = {}
 
 for ticker, df in all_data.items():
     close = df["close"].values
     high  = df["high"].values
     low   = df["low"].values
-    rsi, bb_up, bb_lo, atr, rets = compute_all(close, high, low)
+    rsi, bb_up, bb_lo, atr, rets, vol = compute_indicators(close, high, low)
 
-    # Train/val split: 80/20
-    split = int(len(close) * 0.80)
-    env_train = CryptoEnv(
+    split = int(len(close) * TRAIN_RATIO)
+    env_tr = CryptoTradeEnv(
         close[:split], high[:split], low[:split],
         rsi[:split], bb_up[:split], bb_lo[:split],
-        atr[:split], rets[:split], window=WINDOW)
-    envs_train.append(env_train)
-
-    envs_val[ticker] = CryptoEnv(
+        atr[:split], rets[:split], vol[:split],
+        commission=COMMISSION, window=WINDOW)
+    env_val = CryptoTradeEnv(
         close[split:], high[split:], low[split:],
         rsi[split:], bb_up[split:], bb_lo[split:],
-        atr[split:], rets[split:], window=WINDOW)
+        atr[split:], rets[split:], vol[split:],
+        commission=COMMISSION, window=WINDOW)
 
-multi_env = MultiEnv(envs_train)
-print(f"  obs_dim={multi_env.observation_space.shape[0]}, train_envs={len(envs_train)}")
+    train_envs.append(env_tr)
+    val_envs[ticker]  = env_val
+    print(f"  {ticker}: train={split} bars, val={len(close)-split} bars")
+
+multi_env = MultiInputEnv(train_envs)
+print(f"  obs_dim={multi_env.observation_space.shape[0]}, n_envs={len(train_envs)}")
+
+# Verify obs shape
+test_obs, _ = multi_env.reset()
+print(f"  test obs shape: {test_obs.shape}")
 
 # Train
 print("\n[3] Training MaskablePPO (200k steps)...")
@@ -326,7 +331,7 @@ from sb3_contrib.common.maskable.policies import MaskableActorCriticPolicy
 
 ppo = MaskablePPO(
     MaskableActorCriticPolicy, multi_env,
-    policy_kwargs=dict(net_arch=[dict(pi=[128, 128, 64], vf=[128, 128, 64])]),
+    policy_kwargs=dict(net_arch=dict(pi=[128, 128, 64], vf=[128, 128, 64])),
     learning_rate=8e-5,
     n_steps=1024,
     batch_size=64,
@@ -338,18 +343,18 @@ ppo = MaskablePPO(
 )
 
 ppo.learn(total_timesteps=200_000, progress_bar=True)
+
 MODEL_OUT = "C:/OpenMythos/maskable_ppo_crypto_v2.zip"
 ppo.save(MODEL_OUT)
 print(f"\nModel saved: {MODEL_OUT}")
 
 # Validate
 print("\n[4] Per-ticker validation...")
-total_return = 0
-for ticker, env in envs_val.items():
-    cum, trades = run_agent(ppo, env)
-    m = metrics(cum, trades)
-    total_return += m["return"]
-    print(f"  {ticker:8s} | Ret={m['return']:>8.2f}% | Trades={m['n']:>3d} | WinRate={m['win_rate']:>5.1f}%")
+total_ret = 0
+for ticker, env in val_envs.items():
+    m = run_agent(ppo, env)
+    total_ret += m["return"]
+    print(f"  {ticker:8s} | Ret={m['return']:>8.2f}% | Trades={m['n_trades']:>3d} | WinRate={m['win_rate']:>5.1f}%")
 
-print(f"\n  Avg Return: {total_return/len(envs_val):.2f}%")
+print(f"\n  Portfolio Avg Return: {total_ret/len(val_envs):.2f}%")
 print("\n[OK] Training complete!")
